@@ -1,0 +1,129 @@
+networks:
+  backend:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  minio-data:
+  open-webui-data:
+
+services:
+
+  # ── MLflow stack ──────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio
+    ports: ["9000:9000", "9001:9001"]
+    volumes:
+      - minio-data:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    networks: [backend]
+    command: server /data --console-address ":9001"
+
+  mc-init:
+    image: minio/mc
+    depends_on: [minio]
+    restart: on-failure
+    networks: [backend]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set minio http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do
+        echo 'Waiting for MinIO...'; sleep 2;
+      done &&
+      mc mb --ignore-existing minio/mlflow-artifacts
+      "
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    ports: ["5000:5000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mc-init:
+        condition: service_completed_successfully
+
+    networks: [backend]
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: ${MLFLOW_S3_ENDPOINT_URL_INTERNAL}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      MLFLOW_ALLOWED_HOSTS: "all"
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      --default-artifact-root s3://mlflow-artifacts
+      --host 0.0.0.0
+      --port 5000
+      --allowed-hosts all
+      --disable-security-middleware
+
+  # ── Inference stack ───────────────────────────────────────────────────────
+
+  vllm:
+    image: vllm/vllm-openai:nightly
+    runtime: nvidia
+    ipc: host                            # required for PyTorch shared memory / tensor parallel
+    ports: ["8000:8000"]
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ./adapters:/adapters             # local adapter artifact cache
+    environment:
+      - VLLM_ALLOW_RUNTIME_LORA_UPDATING=true
+      - HF_TOKEN=${HF_TOKEN}
+    networks: [backend]
+    command: >
+      Qwen/Qwen3.5-0.8B
+      --port 8000
+      --enable-lora
+      --max-lora-rank 64
+      --max-model-len 8192
+      --enable-prefix-caching
+      --gpu-memory-utilization 0.70
+      --enforce-eager
+
+  proxy:
+    build: ./proxy
+    ports: ["8080:8080"]
+    volumes:
+      - ./adapters:/app/adapters         # same host dir as vLLM mount
+      - ./tasks:/app/tasks               # task processors and prompts
+    environment:
+      - VLLM_BASE_URL=http://vllm:8000
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - MLFLOW_S3_ENDPOINT_URL=${MLFLOW_S3_ENDPOINT_URL_INTERNAL}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    depends_on: [vllm, mlflow]
+    networks: [backend]
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    ports: ["3000:8080"]
+    volumes:
+      - open-webui-data:/app/backend/data
+    environment:
+      - OPENAI_API_BASE_URLS=http://proxy:8080/v1
+      - WEBUI_AUTH=false
+      - ENABLE_OLLAMA_API=false
+    depends_on: [proxy]
+    networks: [backend]

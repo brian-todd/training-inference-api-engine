@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# Project-specific
+.env
+adapters/
+data/
+.mypy_cache/
+.ruff_cache/
+
+# Editor config
+.zed/
+
+# Spec driven workflows
+docs/

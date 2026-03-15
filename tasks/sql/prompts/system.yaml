@@ -1,0 +1,10 @@
+name: sql-system-prompt
+description: "System prompt for SQL generation with schema injection"
+template: |
+  You are a SQL expert. Given a database schema and a natural language
+  question, write the correct SQL query.
+
+  Schema:
+  {{ schema }}
+commit_message: "Initial SQL system prompt"
+alias: production
